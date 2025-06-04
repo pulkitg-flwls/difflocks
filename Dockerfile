@@ -24,6 +24,10 @@ libglx0 \
 libopengl0 \
 && rm -rf /var/lib/apt/lists/*
 
+RUN apt-get update && apt-get install -y \
+    p7zip-full \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install Miniconda
 RUN wget --quiet https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh && \
     bash /tmp/miniconda.sh -b -p $CONDA_DIR && rm /tmp/miniconda.sh && \
@@ -55,8 +59,22 @@ RUN source $CONDA_DIR/etc/profile.d/conda.sh && conda activate $ENV_NAME && \
     TORCH_CUDA_ARCH_LIST="9.0" NATTEN_CUDA_ARCH="9.0" FORCE_CUDA=1 python setup.py install
     # pip install git+https://github.com/SHI-Labs/NATTEN.git
 
-# Set workdir and default PYTHONPATH
+RUN apt-get update && apt-get install -y p7zip-full
+RUN curl -L -o /usr/local/bin/7zz https://www.7-zip.org/a/7zz && \
+    chmod +x /usr/local/bin/7zz
+ARG USERNAME=appuser
+ARG USER_UID=1000
+ARG USER_GID=1000
+
+RUN groupadd --gid $USER_GID $USERNAME && \
+    useradd --uid $USER_UID --gid $USER_GID -m $USERNAME && \
+    chown -R $USERNAME:$USERNAME /app /opt/conda
+USER $USERNAME
+    # Set workdir and default PYTHONPATH
+# WORKDIR /app/projects
+# ENV PYTHONPATH=/app/projects
 WORKDIR /app/projects
+ENV HOME=/home/$USERNAME
 ENV PYTHONPATH=/app/projects
 
 # Default shell will drop into the activated conda environment

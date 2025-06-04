@@ -27,7 +27,7 @@ def main():
     onlyfiles = [f for f in listdir(in_path) if isfile(join(in_path, f))]
     for file_name in onlyfiles:
         filepath=os.path.join(in_path,file_name)
-        cmd=["7zz","x", "-y", filepath, "-o"+args.out_path]
+        cmd=["7z","x", "-y", filepath, "-o"+args.out_path]
         # print("cmd",cmd)
         subprocess.run(cmd, capture_output=False)
         print("filename", file_name)
