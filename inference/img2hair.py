@@ -220,7 +220,7 @@ class DiffLocksInference():
         ])
         self.dinov2_latents_model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14_reg')
         self.dinov2_latents_model.cuda()
-
+        
         #difflocks strand codec
         self.strand_codec = StrandCodec(do_vae=False, 
                         decode_type="dir",
@@ -299,6 +299,7 @@ class DiffLocksInference():
         #dinov2 v2 
         rgb_input = self.dinov2_latents_preprocessor(rgb_img).to("cuda")
         dinov2_output = self.dinov2_latents_model.forward_features(rgb_input)
+        
         patch_tok = dinov2_output["x_norm_patchtokens"].clone()
         cls_tok = dinov2_output["x_norm_clstoken"].clone()
         cls_token=cls_tok

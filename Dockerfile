@@ -70,6 +70,8 @@ RUN groupadd --gid $USER_GID $USERNAME && \
     useradd --uid $USER_UID --gid $USER_GID -m $USERNAME && \
     chown -R $USERNAME:$USERNAME /app /opt/conda
 USER $USERNAME
+RUN echo ". $CONDA_DIR/etc/profile.d/conda.sh" >> /home/$USERNAME/.bashrc && \
+    echo "conda activate $ENV_NAME" >> /home/$USERNAME/.bashrc
     # Set workdir and default PYTHONPATH
 # WORKDIR /app/projects
 # ENV PYTHONPATH=/app/projects

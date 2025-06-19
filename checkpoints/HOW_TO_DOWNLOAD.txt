@@ -1,2 +1,0 @@
-If you want to download the checkpoints please use the download_checkpoints.sh script from the root of the repo.
-It will download all necessary checkpoints and unzip them in this folder
