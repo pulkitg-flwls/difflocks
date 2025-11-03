@@ -49,8 +49,7 @@ RUN echo ". $CONDA_DIR/etc/profile.d/conda.sh" >> ~/.bashrc && \
 COPY environment.yml /tmp/environment.yml
 RUN source $CONDA_DIR/etc/profile.d/conda.sh && \
     mamba env create -f /tmp/environment.yml -c conda-forge && \
-    mamba shell init --shell bash --root-prefix=$CONDA_DIR && \
-    echo "mamba activate $ENV_NAME" >> ~/.bashrc
+    mamba shell init --shell bash --root-prefix=$CONDA_DIR
 
 # Install extra pip packages inside the env
 RUN source $CONDA_DIR/etc/profile.d/conda.sh && \
@@ -68,6 +67,8 @@ RUN source $CONDA_DIR/etc/profile.d/conda.sh && \
     mkdir -p /app/projects/difflocks/externals && \
     git clone --recursive https://github.com/SHI-Labs/NATTEN.git /app/projects/difflocks/externals/natten && \
     cd /app/projects/difflocks/externals/natten && \
+    git checkout v0.17.5 && \
+    git submodule update --init --recursive && \
     TORCH_CUDA_ARCH_LIST="9.0" NATTEN_CUDA_ARCH="9.0" FORCE_CUDA=1 python setup.py install
     # pip install git+https://github.com/SHI-Labs/NATTEN.git
 
@@ -85,6 +86,7 @@ RUN groupadd --gid $USER_GID $USERNAME && \
 
 USER $USERNAME
 RUN echo ". $CONDA_DIR/etc/profile.d/conda.sh" >> /home/$USERNAME/.bashrc && \
+    echo "eval \"\$(mamba shell hook --shell bash)\"" >> /home/$USERNAME/.bashrc && \
     echo "mamba activate $ENV_NAME" >> /home/$USERNAME/.bashrc
 
 # Set workdir and default PYTHONPATH
@@ -92,5 +94,13 @@ WORKDIR /app/projects/difflocks
 ENV HOME=/home/$USERNAME
 ENV PYTHONPATH=/app/projects
 
+# Create a startup script that properly initializes mamba
+RUN echo '#!/bin/bash' > /app/start.sh && \
+    echo 'source $CONDA_DIR/etc/profile.d/conda.sh' >> /app/start.sh && \
+    echo 'eval "$(mamba shell hook --shell bash)"' >> /app/start.sh && \
+    echo 'mamba activate $ENV_NAME' >> /app/start.sh && \
+    echo 'exec "$@"' >> /app/start.sh && \
+    chmod +x /app/start.sh
+
 # Default shell will drop into the activated conda environment
-ENTRYPOINT ["/bin/bash", "--login"]
+ENTRYPOINT ["/app/start.sh", "/bin/bash", "--login"]

@@ -431,7 +431,9 @@ class NeighborhoodSelfAttentionBlock(nn.Module):
         qkv = self.qkv_proj(x)
         if natten is None:
             raise ModuleNotFoundError("natten is required for neighborhood attention")
-        if natten.has_fused_na():
+        # Check if fused NA is available (version compatibility)
+        has_fused = hasattr(natten, 'has_fused_na') and natten.has_fused_na()
+        if has_fused:
             q, k, v = rearrange(qkv, "n h w (t nh e) -> t n h w nh e", t=3, e=self.d_head)
             # print("q", q.shape) #[1, 32, 32, 4, 64])
             # print("k", k.shape)
