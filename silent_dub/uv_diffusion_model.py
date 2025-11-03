@@ -404,6 +404,9 @@ def extract_dinov2_features(dinov2_model, preprocessor, rgb_image, device='cuda'
 
 def test_model():
     """Test the UV diffusion model with actual DINOv2 features"""
+    import k_diffusion as K
+    from torchvision.utils import save_image
+    
     print("=== Testing UV Diffusion Model ===")
     
     # Set precision to avoid FlashAttention warnings
@@ -419,6 +422,7 @@ def test_model():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     dinov2_model = dinov2_model.to(device)
     model = model.to(device)
+    model.eval()
     
     # Create dummy data
     batch_size = 2
@@ -461,6 +465,90 @@ def test_model():
     
     print(f"Unconditional output shape: {output_uncond.shape}")
     print(f"Unconditional logvar shape: {logvar_uncond.shape}")
+    
+    # Conditional generation with DINOv2 features
+    print("\n=== Testing Conditional Generation ===")
+    
+    # Diffusion parameters (matching UV model config)
+    sigma_min = 1e-2
+    sigma_max = 160.0
+    sigma_data = 0.3
+    num_steps = 50
+    
+    # Create denoiser wrapper for Karras preconditioning (v-parametrization)
+    # Same as train_scalp_diffusion.py uses K.config.make_denoiser_wrapper
+    from k_diffusion import layers
+    denoiser = layers.Denoiser(
+        model, 
+        sigma_data=sigma_data,
+        weighting='snr',
+        parametrization='v'
+    )
+    
+    # Generate conditionally (pass latents_dict via extra_args, like train_scalp_diffusion.py)
+    print(f"Generating {batch_size} UV maps conditioned on RGB images...")
+    x_start = torch.randn(batch_size, 3, 512, 512, device=device) * sigma_max
+    sigmas = K.sampling.get_sigmas_karras(num_steps, sigma_min, sigma_max, rho=7.0, device=device)
+    
+    # Pass latents_dict via extra_args - Denoiser forwards it to inner model
+    extra_args_cond = {"latents_dict": latents_dict}
+    
+    with torch.no_grad():
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            x_0_cond = K.sampling.sample_dpmpp_2m_sde(
+                denoiser, 
+                x_start, 
+                sigmas, 
+                extra_args=extra_args_cond, 
+                eta=0.0, 
+                solver_type='heun', 
+                disable=False
+            )
+    
+    print(f"Generated conditional UV maps shape: {x_0_cond.shape}")
+    print(f"Generated range: [{x_0_cond.min():.3f}, {x_0_cond.max():.3f}]")
+    
+    # Unconditional generation (latents_dict=None via extra_args)
+    print("\nGenerating unconditionally...")
+    extra_args_uncond = {"latents_dict": None}
+    x_start_uncond = torch.randn(batch_size, 3, 512, 512, device=device) * sigma_max
+    
+    with torch.no_grad():
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            x_0_uncond = K.sampling.sample_dpmpp_2m_sde(
+                denoiser,
+                x_start_uncond,
+                sigmas,
+                extra_args=extra_args_uncond,
+                eta=0.0,
+                solver_type='heun',
+                disable=False
+            )
+    
+    print(f"Generated unconditional UV maps shape: {x_0_uncond.shape}")
+    print(f"Generated range: [{x_0_uncond.min():.3f}, {x_0_uncond.max():.3f}]")
+    
+    # Save generated samples for visualization
+    try:
+        os.makedirs("test_samples", exist_ok=True)
+        
+        # Normalize to [0, 1] for visualization
+        def normalize_for_viz(x):
+            x_norm = (x - x.min()) / (x.max() - x.min() + 1e-8)
+            return x_norm
+        
+        # Save conditional samples
+        cond_viz = normalize_for_viz(x_0_cond)
+        save_image(cond_viz, "test_samples/conditional_generation.png", nrow=2, normalize=False)
+        print("\nSaved conditional samples to test_samples/conditional_generation.png")
+        
+        # Save unconditional samples
+        uncond_viz = normalize_for_viz(x_0_uncond)
+        save_image(uncond_viz, "test_samples/unconditional_generation.png", nrow=2, normalize=False)
+        print("Saved unconditional samples to test_samples/unconditional_generation.png")
+        
+    except Exception as e:
+        print(f"Could not save images: {e}")
     
     print("\n=== Test completed successfully! ===")
     return model, dinov2_model, dinov2_preprocessor
