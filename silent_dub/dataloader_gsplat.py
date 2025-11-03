@@ -7,7 +7,7 @@ import numpy as np
 import cv2
 from pathlib import Path
 
-def tensor_to_cv(img_tensor, normalize=True):
+def tensor_to_cv(img_tensor, minmax_normalize=False):
     """
     Convert a PyTorch image tensor (C,H,W) in [-1,1] → uint8 BGR numpy array.
 
@@ -25,14 +25,23 @@ def tensor_to_cv(img_tensor, normalize=True):
     if img_tensor.dim() == 4:          # batch – use first element
         img_tensor = img_tensor[0]
 
-    # detach → CPU → numpy, channel-last
-    img = img_tensor.detach().cpu().permute(2, 1, 0).float().numpy()
-
-    # [-1,1] → [0,255]
-    if normalize:
+    # detach → CPU → numpy
+    img = img_tensor.detach().cpu().float().numpy()  # Still in CHW format
+    
+    # [-1,1] → [0,255] or unnormalize ImageNet normalization
+    if minmax_normalize:
+        # Simple [-1,1] → [0,1] → [0,255]
         img = ((img * 0.5) + 0.5) * 255.0
     else:
+        # Unnormalize from T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+        # img is [C,H,W]; unnormalize: img = img * std + mean
+        mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+        std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+        img = img * std + mean
         img = img * 255.0
+    
+    # Convert CHW to HWC (channel-last) for OpenCV
+    img = img.transpose(2, 1, 0)  # (C, H, W) → (H, W, C)
     img = np.clip(img, 0, 255).astype(np.uint8)
 
 
@@ -100,15 +109,22 @@ def load_fotd(fotd_path, frame_idx, device):
     fotd_params_path = fotd_path / f"{frame_idx}.png"
     fotd_params_arr = np.array(Image.open(fotd_params_path))
     fotd_params_arr = (fotd_params_arr / 255.0) # Normalize from [0,255] to [0,1]
-    fotd_dict = {
-        "ref_img": torch.from_numpy(fotd_params_arr[:, :1024, :]).contiguous().permute(2,1,0),    #[3,1024,1024]   # reference image
-        "fotd_img": torch.from_numpy(fotd_params_arr[:, 1024:2048, :]).contiguous().permute(2,1,0),    #[3,1024,1024]   # fotd image
-        "st_img": torch.from_numpy(fotd_params_arr[:, 2048:3072, :]).contiguous().permute(2,1,0),    #[3,1024,1024]   # st image
-        "mask_img": torch.from_numpy(fotd_params_arr[:, 3072:4096, :]).contiguous().permute(2,1,0),    #[3,1024,1024]   # mask image
+    # Dinov2 preprocessing requires image to be in [0,1] and normalized with ImageNet normalization
+    preprocessor = T.Compose([
+        T.Resize((770, 770), interpolation=T.InterpolationMode.BICUBIC),
+        T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ])
+    ref_img = torch.from_numpy(fotd_params_arr[:, :1024, :]).contiguous().permute(2,1,0)
+    ref_img = preprocessor(ref_img)
+    fotd_img = torch.from_numpy(fotd_params_arr[:, 1024:2048, :]).contiguous().permute(2,1,0)
+    st_img = torch.from_numpy(fotd_params_arr[:, 2048:3072, :]).contiguous().permute(2,1,0)
+    mask_img = torch.from_numpy(fotd_params_arr[:, 3072:4096, :]).contiguous().permute(2,1,0)
+    return {
+        "ref_img": ref_img,
+        "fotd_img": fotd_img,
+        "st_img": st_img,
+        "mask_img": mask_img
     }
-    
-    return fotd_dict
-
 
 
 class SilentDubDataset(Dataset):
@@ -299,34 +315,56 @@ if __name__ == "__main__":
         closed_data = sample["closed"]
         
         
-        img_path = f"test_images/fotd_open_ref_img.png"
-        img = open_data['fotd_params']['ref_img']
-        np_img = tensor_to_cv(img,normalize=False)
-        print(f"Open frame fotd shapes: {np_img.shape}")
-        Image.fromarray(np_img).save(img_path)
-        
-        img_path = f"test_images/fotd_closed_ref_img.png"
-        img = closed_data['fotd_params']['ref_img']
-        np_img = tensor_to_cv(img,normalize=False)
-        print(f"Closed frame fotd shapes: {np_img.shape}")
-        Image.fromarray(np_img).save(img_path)
-        
-        
-        img_path = f"test_images/gsplat_open_uvmap.png"
-        img = open_data['gsplat_params']['aces_diffuse_alb']
-        np_img = tensor_to_cv(img,normalize=True)
-        print(f"Open frame gsplat shapes: {np_img.shape}")
-        Image.fromarray(np_img).save(img_path)
+        # Compose visualization: top row open [fotd_open  uvmap_open], bottom row closed [fotd_closed  uvmap_closed]
 
-        img_path = f"test_images/gsplat_closed_uvmap.png"
-        img = closed_data['gsplat_params']['aces_diffuse_alb']
-        np_img = tensor_to_cv(img,normalize=True)
-        print(f"Closed frame gsplat shapes: {np_img.shape}")
-        Image.fromarray(np_img).save(img_path)
+        # Convert fotd (770x770) and gsplat_uv (512x512) to np.uint8 BGR
+        fotd_open = tensor_to_cv(open_data['fotd_params']['ref_img'], minmax_normalize=False)
+        fotd_close = tensor_to_cv(closed_data['fotd_params']['ref_img'], minmax_normalize=False)
 
-        img_path = f"test_images/mask_sample.png"
-        img = sample['mask']
-        np_img = tensor_to_cv(img,normalize=False)
-        print(f"Mask shapes: {np_img.shape}")
-        Image.fromarray(np_img).save(img_path)
+        gsplat_open = tensor_to_cv(open_data['gsplat_params']['aces_diffuse_alb'], minmax_normalize=True)
+        gsplat_close = tensor_to_cv(closed_data['gsplat_params']['aces_diffuse_alb'], minmax_normalize=True)
+
+        # Pad gsplat images from 512x512 to 770x770 (BGR)
+        def pad_to_770(img):
+            h, w, c = img.shape
+            pad_h = 770 - h
+            pad_w = 770 - w
+            pad_top = pad_h // 2
+            pad_bottom = pad_h - pad_top
+            pad_left = pad_w // 2
+            pad_right = pad_w - pad_left
+            return np.pad(img, ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)), mode='constant', constant_values=0)
+
+        gsplat_open_pad = pad_to_770(gsplat_open)
+        gsplat_close_pad = pad_to_770(gsplat_close)
+
+        # Concatenate top row: [fotd_open, gsplat_open_pad]
+        row1 = np.concatenate([fotd_open, gsplat_open_pad], axis=1)
+        # Concatenate bottom row: [fotd_close, gsplat_close_pad]
+        row2 = np.concatenate([fotd_close, gsplat_close_pad], axis=1)
+        # Stack rows vertically
+        vis_img = np.concatenate([row1, row2], axis=0)
+
+        print(f"viz img shape (HxW): {vis_img.shape}")
+        out_path = f"test_images/composite_fotd_gsplat_grid.png"
+        Image.fromarray(vis_img).save(out_path)
+        
+        
+        # img_path = f"test_images/gsplat_open_uvmap.png"
+        # img = open_data['gsplat_params']['aces_diffuse_alb']
+        # np_img = tensor_to_cv(img,minmax_normalize=True)
+        # print(f"Open frame gsplat shapes: {np_img.shape}")
+        # Image.fromarray(np_img).save(img_path)
+
+        # img_path = f"test_images/gsplat_closed_uvmap.png"
+        # img = closed_data['gsplat_params']['aces_diffuse_alb']
+        # np_img = tensor_to_cv(img,minmax_normalize=True)
+        # print(f"Closed frame gsplat shapes: {np_img.shape}")
+        # Image.fromarray(np_img).save(img_path)
+
+        # img_path = f"test_images/mask_sample.png"
+        # img = sample['mask']
+        # np_img = tensor_to_cv(img,minmax_normalize=False)
+        # print(f"Mask shapes: {np_img.shape}")
+        # Image.fromarray(np_img).save(img_path)
         
