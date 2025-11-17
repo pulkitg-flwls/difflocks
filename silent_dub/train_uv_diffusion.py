@@ -36,10 +36,92 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 import k_diffusion as K
 
 # Import our modules
-from uv_diffusion_model import create_uv_diffusion_model
 from dataloader_gsplat import SilentDubDataset
+from uv_diffusion_model import create_uv_diffusion_model_from_config
 
 torch._dynamo.config.optimize_ddp = False
+
+class MaskedUVDenoiser(K.layers.Denoiser):
+    """
+    Custom Denoiser for masked UV diffusion.
+    Only computes loss on the first 3 channels (uv_comp prediction).
+    The remaining channels (uv_og, mask) are context, not ground truth.
+    """
+    def loss(self, input, noise, sigma, **kwargs):
+        """
+        Compute loss only on first 3 channels (uv_comp).
+        Input shape: [B, 7, H, W] = [uv_comp, uv_og, mask_1ch]
+        Ground truth: only uv_comp (first 3 channels)
+        """
+        from k_diffusion import utils
+        
+        c_skip, c_out, c_in = [utils.append_dims(x, input.ndim) for x in self.get_scalings(sigma)]
+        c_weight = self.weighting(sigma)
+        weight = c_weight
+        
+        noised_input = input + noise * utils.append_dims(sigma, input.ndim)
+        
+        step = None
+        if 'step' in kwargs:
+            step = kwargs['step']
+            del kwargs['step']
+        result = self.inner_model(noised_input * c_in, sigma, **kwargs)
+        clip_feature_embedding = None
+        if len(result) == 2:
+            model_output, logvar = result
+        elif len(result) == 4:
+            model_output, multires_output, logvar, clip_feature_embedding = result
+        else:
+            raise ValueError(f"Unexpected model output length: {len(result)}")
+        
+        # Extract components from input
+        # Input: [B, 7, H, W] = [uv_comp, uv_og, mask_1ch]
+        input_gt = input[:, :3, :, :]  # [B, 3, H, W] - uv_comp
+        noised_input_gt = noised_input[:, :3, :, :]  # [B, 3, H, W]
+        model_output_gt = model_output[:, :3, :, :]  # [B, 3, H, W]
+        noise_gt = noise[:, :3, :, :]  # [B, 3, H, W] - actual noise that was added
+        uv_og = input[:, 3:6, :, :]  # [B, 3, H, W]
+        mask_1ch = input[:, 6:7, :, :]  # [B, 1, H, W]
+        
+        # Get denoised prediction (uv_pred) - first 3 channels
+        if self.parametrization == "v":
+            uv_pred = model_output_gt.to(torch.float32) * c_out + noised_input_gt * c_skip
+        else:  # x0 parametrization
+            uv_pred = model_output_gt.to(torch.float32)
+        
+        # Compute predicted noise from model output
+        # noised_input = input + noise * sigma
+        # So: predicted_noise = (noised_input - predicted_clean) / sigma
+        sigma_expanded = utils.append_dims(sigma, input_gt.ndim)  # [B, 1, 1, 1]
+        predicted_noise = (noised_input_gt - uv_pred) / sigma_expanded  # [B, 3, H, W]
+        
+        # Losses:
+        # 1. Diffusion loss: compare predicted noise with actual noise
+        #    ||predicted_noise - actual_noise||²
+        diffusion_loss = ((predicted_noise - noise_gt) ** 2).flatten(1).mean(1)  # [B]
+        
+        # 2. Noise loss: ensure unmasked region matches uv_og
+        #    ||uv_og*(1-mask) - uv_pred*(1-mask)||²
+        unmasked_uv_og = uv_og * (1 - mask_1ch)  # [B, 3, H, W]
+        unmasked_uv_pred = uv_pred * (1 - mask_1ch)  # [B, 3, H, W]
+        noise_loss = ((unmasked_uv_og - unmasked_uv_pred) ** 2).flatten(1).mean(1)  # [B]
+        
+        # 3. TV loss on masked region: uv_pred*mask
+        masked_uv_pred = uv_pred * mask_1ch  # [B, 3, H, W]
+        # Total Variation: sum of absolute differences between adjacent pixels
+        # TV = |x[i+1,j] - x[i,j]| + |x[i,j+1] - x[i,j]|
+        tv_h = torch.abs(masked_uv_pred[:, :, 1:, :] - masked_uv_pred[:, :, :-1, :])  # [B, 3, H-1, W]
+        tv_w = torch.abs(masked_uv_pred[:, :, :, 1:] - masked_uv_pred[:, :, :, :-1])  # [B, 3, H, W-1]
+        tv_loss = (tv_h.sum(dim=(1, 2, 3)) + tv_w.sum(dim=(1, 2, 3))) / (masked_uv_pred.shape[2] * masked_uv_pred.shape[3])  # [B]
+        
+        # Weight the losses (can be made configurable)
+        diffusion_loss_weight = 1.0
+        noise_loss_weight = 1.0
+        tv_loss_weight = 0.1
+        total_loss = diffusion_loss_weight * diffusion_loss + noise_loss_weight * noise_loss + tv_loss_weight * tv_loss
+        
+        # Return losses: (total_loss, diffusion_loss, noise_loss, tv_loss)
+        return total_loss, diffusion_loss, noise_loss, tv_loss
 
 def ensure_distributed():
     if not dist.is_initialized():
@@ -94,6 +176,10 @@ def get_cli_args():
                    help='flag to use tensorboard for logging scalars and images')
     p.add_argument('--open-ratio-threshold', type=float, default=0.1,
                    help='Threshold for open/closed classification')
+    p.add_argument('--template-dir', type=str, default=None,
+                   help='Template directory with gsplat.npy and fotd.png (optional)')
+    p.add_argument('--out-channels', type=int, default=None,
+                   help='Number of output channels (overrides config.json, defaults to input_channels if not specified)')
     args = p.parse_args()
 
     return args
@@ -110,7 +196,14 @@ def main():
 
     config = K.config.load_config(args.config)
     model_config = config['model']
-    dataset_config = config['dataset']
+    # Override out_channels from CLI argument if provided
+    if args.out_channels is not None:
+        model_config['out_channels'] = args.out_channels
+        print(f'Overriding out_channels from CLI: {args.out_channels}')
+    # dataset_config is required by k_diffusion config loader but not used for SilentDubDataset
+    # dataset_config is not used for UV diffusion and is for classifier-free guidance (CFG)
+    # SilentDubDataset is created from CLI arguments, not from config
+    dataset_config = config.get('dataset', {})  # Get with default to avoid KeyError
     opt_config = config['optimizer']
     sched_config = config['lr_sched']
     ema_sched_config = config['ema_sched']
@@ -138,8 +231,10 @@ def main():
         random.seed(seeds[accelerator.process_index])
     demo_gen = torch.Generator().manual_seed(torch.randint(-2 ** 63, 2 ** 63 - 1, ()).item())
 
-    # Create UV diffusion model
-    inner_model = create_uv_diffusion_model()
+    # Create UV diffusion model from config using uv_diffusion_model utility
+    # This ensures consistent model creation and handles config validation
+    # Pass the modified config dict so CLI overrides are respected
+    inner_model = create_uv_diffusion_model_from_config(config_path=args.config, config_dict=config, device=device)
     inner_model_ema = deepcopy(inner_model)
 
     print("args.compile", args.compile)
@@ -154,6 +249,7 @@ def main():
         from torch.utils.tensorboard import SummaryWriter
         tensorboard_writer = SummaryWriter("tensorboard_logs/"+args.name)
 
+    # Optimizer for the UV diffusion model
     lr = opt_config['lr'] if args.lr is None else args.lr
     groups = inner_model.param_groups(lr)
     opt = optim.AdamW(groups,
@@ -187,6 +283,7 @@ def main():
         root_dir=args.root_dir,
         json_dir=args.json_dir,
         mask_path=args.mask_path,
+        template_dir=args.template_dir,
         device=device,
         open_ratio_threshold=args.open_ratio_threshold,
         load_dinov2=True  # Enable DINOv2 feature extraction in dataset
@@ -198,8 +295,11 @@ def main():
         except TypeError:
             pass
 
-    num_classes = dataset_config.get('num_classes', 0)
-    cond_dropout_rate = dataset_config.get('cond_dropout_rate', 0.1)
+    # Note: num_classes and cond_dropout_rate from dataset_config are not used
+    # SilentDubDataset handles its own configuration via CLI arguments
+    # These are kept for compatibility with k_diffusion framework expectations
+    num_classes = dataset_config.get('num_classes', 0)  # Not used for UV diffusion
+    # cond_dropout_rate is not used - model uses model_config['condition_dropout_rate'] instead
 
     # DINOv2 extraction is now handled inside SilentDubDataset.__getitem__
     # If using num_workers > 0, each worker will load its own DINOv2 model
@@ -222,9 +322,30 @@ def main():
     sigma_max = model_config['sigma_max']
     sample_density = K.config.make_sample_density(model_config)
 
-    # Create denoiser wrapper
-    model = K.config.make_denoiser_wrapper(config)(inner_model)
-    model_ema = K.config.make_denoiser_wrapper(config)(inner_model_ema)
+    # Create custom denoiser wrapper for masked UV diffusion
+    # Only computes loss on first 3 channels (uv_comp), not on uv_og and mask
+    sigma_data = model_config.get('sigma_data', 1.)
+    weighting = model_config.get('loss_weighting', 'karras')
+    scales = model_config.get('loss_scales', 1)
+    parametrization = model_config.get('parametrization', 'v')
+    loss_weight_per_channel = model_config.get('loss_weight_per_channel', None)
+    
+    model = MaskedUVDenoiser(
+        inner_model,
+        sigma_data=sigma_data,
+        weighting=weighting,
+        scales=scales,
+        parametrization=parametrization,
+        loss_weight_per_channel=loss_weight_per_channel
+    )
+    model_ema = MaskedUVDenoiser(
+        inner_model_ema,
+        sigma_data=sigma_data,
+        weighting=weighting,
+        scales=scales,
+        parametrization=parametrization,
+        loss_weight_per_channel=loss_weight_per_channel
+    )
 
     state_path = Path(f'{args.name}_state.json')
 
@@ -271,6 +392,7 @@ def main():
     cfg_scale = 1.
 
     def make_cfg_model_fn(model):
+        # CFG (Classifier-Free Guidance) function - not used for UV diffusion (num_classes=0)
         def cfg_model_fn(x, sigma, class_cond):
             x_in = torch.cat([x, x])
             sigma_in = torch.cat([sigma, sigma])
@@ -285,19 +407,98 @@ def main():
 
     @torch.no_grad()
     @K.utils.eval_mode(model_ema)
-    def sample_images(nr_images):
+    def sample_images(nr_images, uv_og_batch, latents_dict_batch, mask_1ch_batch):
+        """
+        Sample images conditionally on DINOv2 latents and uv_og.
+        
+        Args:
+            nr_images: Number of images to sample
+            uv_og_batch: Closed mouth UV maps [B, 3, H, W]
+            latents_dict_batch: DINOv2 latents dict from batch
+            mask_1ch_batch: Mask tensor [B, 1, H, W]
+        """
         if accelerator.is_main_process:
-            tqdm.write('Sampling...')
+            tqdm.write('Sampling conditionally with DINOv2 and uv_og...')
+        
+        # Limit to available batch size
+        batch_size = uv_og_batch.shape[0]
+        nr_images = min(nr_images, batch_size)
+        
+        # Use first nr_images samples from batch
+        uv_og = uv_og_batch[:nr_images]  # [nr_images, 3, H, W]
+        mask_1ch = mask_1ch_batch[:nr_images]  # [nr_images, 1, H, W]
+        
+        # Prepare latents for conditioning
+        latents_dict = {}
+        if latents_dict_batch is not None and "dinov2" in latents_dict_batch:
+            dinov2_latents = latents_dict_batch["dinov2"]
+            # Take first nr_images samples
+            latents_dict["dinov2"] = {
+                k: v[:nr_images] if isinstance(v, torch.Tensor) else v
+                for k, v in dinov2_latents.items()
+            }
+        
+        # Start with noisy_uv_comp = uv_og * (1-mask) + noise * mask (matching training input structure)
+        # Input shape: [nr_images, 7, H, W] = [noisy_uv_comp, uv_og, mask_1ch]
         n_per_proc = math.ceil(nr_images / accelerator.num_processes)
-        x = torch.randn([accelerator.num_processes, n_per_proc, model_config['input_channels'], size[0], size[1]], generator=demo_gen).to(device)
-        dist.broadcast(x, 0)
-        x = x[accelerator.process_index] * sigma_max
-        model_fn, extra_args = model_ema, {}
-        # For UV diffusion, we can sample unconditionally or conditionally
-        # For now, sample unconditionally (no DINOv2 features)
+        noise_uv = torch.randn([accelerator.num_processes, n_per_proc, 3, size[0], size[1]], generator=demo_gen).to(device)
+        dist.broadcast(noise_uv, 0)
+        noise_uv = noise_uv[accelerator.process_index]  # [n_per_proc, 3, H, W]
+        
+        # Distribute uv_og and mask_1ch across processes
+        # Pad to ensure we have enough for all processes
+        total_needed = accelerator.num_processes * n_per_proc
+        if uv_og.shape[0] < total_needed:
+            pad_size = total_needed - uv_og.shape[0]
+            uv_og = torch.cat([uv_og, uv_og[-1:].repeat(pad_size, 1, 1, 1)], dim=0)
+            mask_1ch = torch.cat([mask_1ch, mask_1ch[-1:].repeat(pad_size, 1, 1, 1)], dim=0)
+        
+        # Split across processes
+        start_idx = accelerator.process_index * n_per_proc
+        end_idx = start_idx + n_per_proc
+        uv_og_proc = uv_og[start_idx:end_idx].to(device)  # [n_per_proc, 3, H, W]
+        mask_1ch_proc = mask_1ch[start_idx:end_idx].to(device)  # [n_per_proc, 1, H, W]
+        
+        # Construct noisy_uv_comp: uv_og in unmasked region, noise in masked region
+        # This matches training: uv_comp = uv_og * (1-mask) + template * mask
+        # At test time: noisy_uv_comp = uv_og * (1-mask) + noise * mask (at sigma_max)
+        noise_uv_masked = noise_uv * mask_1ch_proc  # [n_per_proc, 3, H, W] - noise only in masked region
+        noisy_uv_comp = uv_og_proc * (1 - mask_1ch_proc) + noise_uv_masked * sigma_max  # [n_per_proc, 3, H, W]
+        
+        # Create initial x: [noisy_uv_comp, uv_og, mask_1ch] at sigma_max
+        # This matches the training input structure: [uv_comp + noise*sigma, uv_og, mask_1ch]
+        x = torch.cat([noisy_uv_comp, uv_og_proc, mask_1ch_proc], dim=1)  # [n_per_proc, 7, H, W]
+        
+        # Prepare extra_args with DINOv2 conditioning
+        extra_args = {}
+        if cross_cond and latents_dict:
+            # Prepare latents for this process
+            proc_latents_dict = {}
+            if "dinov2" in latents_dict:
+                proc_dinov2 = latents_dict["dinov2"]
+                start_idx = accelerator.process_index * n_per_proc
+                end_idx = start_idx + n_per_proc
+                # Pad latents if needed
+                proc_latents_dict["dinov2"] = {}
+                for k, v in proc_dinov2.items():
+                    if isinstance(v, torch.Tensor):
+                        if v.shape[0] >= end_idx:
+                            proc_v = v[start_idx:end_idx].to(device)
+                        else:
+                            # Pad with last element
+                            proc_v = v[-1:].repeat(n_per_proc, *([1] * (v.ndim - 1))).to(device)
+                        proc_latents_dict["dinov2"][k] = proc_v
+                    else:
+                        proc_latents_dict["dinov2"][k] = v
+            extra_args["latents_dict"] = proc_latents_dict
+        
+        model_fn = model_ema
         sigmas = K.sampling.get_sigmas_karras(100, sigma_min, sigma_max, rho=7., device=device)
         x_0 = K.sampling.sample_dpmpp_2m_sde(model_fn, x, sigmas, extra_args=extra_args, eta=0.0, solver_type='heun', disable=not accelerator.is_main_process)
         x_0 = accelerator.gather(x_0)[:nr_images]
+        
+        # Extract only first 3 channels (uv_comp prediction)
+        x_0 = x_0[:, :3, :, :]  # [nr_images, 3, H, W]
         return x_0
 
     def save():
@@ -348,13 +549,34 @@ def main():
                         first_batch = batch
 
                     with torch.no_grad():
-                        # Training setup:
-                        # - reals: open mouth UV map (target) [B, 3, 512, 512]
-                        # - Input to HDiT during training: noise + open_UV (via diffusion)
-                        # - Conditioning: DINOv2 features from closed RGB image
-                        # - Closed UV (batch["closed"]["gsplat_params"]["aces_diffuse_alb"]) available but not used in training loss
-                        #   (can be used for initialization during inference)
-                        reals = batch["open"]["gsplat_params"]["aces_diffuse_alb"]  # Target: open mouth UV map [B, 3, 512, 512]
+                        # Training setup with masked diffusion (similar to scalp_diffusion):
+                        # - uv_og: closed mouth UV map [B, 3, 512, 512]
+                        # - template: template teeth UV map [B, 3, 512, 512]
+                        # - mask: mask tensor [3, 512, 512] or [B, 3, 512, 512] -> converted to 1 channel
+                        # - uv_comp: composite target = uv_og * (1-mask) + template * mask
+                        # - reals: input to model = concat([uv_comp, uv_og, mask]) [B, 7, 512, 512]
+                        #   Similar to scalp_diffusion where reals = concat([scalp_texture, density_img])
+                        uv_og = batch["closed"]["gsplat_params"]["aces_diffuse_alb"]  # [B, 3, 512, 512]
+                        template = batch["template_teeth"]["gsplat_params"]["aces_diffuse_alb"]  # [B, 3, 512, 512]
+                        mask = batch["mask"]  # [3, 512, 512] or [B, 3, 512, 512]
+                        
+                        # Ensure mask is batched and on correct device
+                        if mask.dim() == 3:
+                            mask = mask.unsqueeze(0)  # [1, 3, 512, 512]
+                        if mask.shape[0] != uv_og.shape[0]:
+                            mask = mask.expand(uv_og.shape[0], -1, -1, -1)  # [B, 3, 512, 512]
+                        mask = mask.to(uv_og.device)
+                        
+                        # Convert mask from 3 channels to 1 channel (take first channel)
+                        mask_1ch = mask[:, 0:1, :, :]  # [B, 1, 512, 512]
+                        
+                        # Create composite target: closed UV with template teeth in masked region
+                        # mask_1ch broadcasts with [B, 3, 512, 512] UV maps
+                        uv_comp = uv_og * (1 - mask_1ch) + template * mask_1ch  # [B, 3, 512, 512]
+                        
+                        # Input to model: concatenate [uv_comp, uv_og, mask_1ch] along channel dimension
+                        # This is the "clean" version - noise will be added by the denoiser
+                        reals = torch.cat([uv_comp, uv_og, mask_1ch], dim=1)  # [B, 7, 512, 512]
 
                     class_cond, extra_args = None, {}
                     cross_cond = bool(model_config['cross_cond'])
@@ -364,7 +586,13 @@ def main():
                     if cross_cond:
                         extra_args["latents_dict"] = batch["latents"]
                     
-                    noise = torch.randn_like(reals)
+                    # Generate noise matching reals shape [B, 7, 512, 512]
+                    # Noise only in first 3 channels (uv_comp), zeros for uv_og and mask channels
+                    noise_uv = torch.randn_like(uv_comp)  # [B, 3, 512, 512]
+                    noise_uv = noise_uv * mask_1ch  # Only noise in masked region (broadcasts)
+                    noise_zeros = torch.zeros_like(uv_og)  # [B, 3, 512, 512] - no noise for uv_og
+                    noise_mask = torch.zeros_like(mask_1ch)  # [B, 1, 512, 512] - no noise for mask
+                    noise = torch.cat([noise_uv, noise_zeros, noise_mask], dim=1)  # [B, 7, 512, 512]
                     
                     # Immiscible diffusion (optional, disabled for now)
                     do_immiscible_diffusion = False
@@ -396,11 +624,17 @@ def main():
                     with K.utils.enable_stratified_accelerate(accelerator, disable=args.gns):
                         sigma = sample_density([reals.shape[0]], device=device)
                     with K.models.checkpointing(args.checkpointing):
-                        losses, singleres_losses, multires_losses, mse_losses = model.loss(reals, noise, sigma, **extra_args)
+                        # Model receives reals [B, 7, 512, 512] = [uv_comp, uv_og, mask_1ch]
+                        # Noise [B, 7, 512, 512] with noise only in first 3 channels (masked region)
+                        # Denoiser will compute: noised_input = reals + noise * sigma
+                        # Model will receive: noised_input * c_in = [noisy_uv_comp, uv_og, mask_1ch] * c_in
+                        # Custom loss function returns: (total_loss, diffusion_loss, noise_loss, tv_loss)
+                        losses, diffusion_losses, noise_losses, tv_losses = model.loss(reals, noise, sigma, **extra_args)
+                    
                     loss = accelerator.gather(losses).mean().item()
-                    singleres_loss = accelerator.gather(singleres_losses).mean().item()
-                    multires_loss = accelerator.gather(multires_losses).mean().item()
-                    mse_loss = accelerator.gather(mse_losses).mean().item()
+                    diffusion_loss = accelerator.gather(diffusion_losses).mean().item()
+                    noise_loss = accelerator.gather(noise_losses).mean().item()
+                    tv_loss = accelerator.gather(tv_losses).mean().item()
                     losses_since_last_print.append(loss)
                     accelerator.backward(losses.mean())
                     if args.gns:
@@ -414,9 +648,9 @@ def main():
 
                     ema_decay = ema_sched.get_value()
                     K.utils.ema_update_dict(ema_stats, {'loss': loss}, ema_decay ** (1 / args.grad_accum_steps))
-                    K.utils.ema_update_dict(ema_stats, {'singleres_loss': singleres_loss}, ema_decay ** (1 / args.grad_accum_steps))
-                    K.utils.ema_update_dict(ema_stats, {'multires_loss': multires_loss}, ema_decay ** (1 / args.grad_accum_steps))
-                    K.utils.ema_update_dict(ema_stats, {'mse_loss': mse_loss}, ema_decay ** (1 / args.grad_accum_steps))
+                    K.utils.ema_update_dict(ema_stats, {'diffusion_loss': diffusion_loss}, ema_decay ** (1 / args.grad_accum_steps))
+                    K.utils.ema_update_dict(ema_stats, {'noise_loss': noise_loss}, ema_decay ** (1 / args.grad_accum_steps))
+                    K.utils.ema_update_dict(ema_stats, {'tv_loss': tv_loss}, ema_decay ** (1 / args.grad_accum_steps))
                     if accelerator.sync_gradients:
                         K.utils.ema_update(model, model_ema, ema_decay)
                         ema_sched.step()
@@ -425,27 +659,133 @@ def main():
                     loss_disp = sum(losses_since_last_print) / len(losses_since_last_print)
                     losses_since_last_print.clear()
                     avg_loss = ema_stats['loss']
+                    avg_diffusion_loss = ema_stats.get('diffusion_loss', 0)
+                    avg_noise_loss = ema_stats.get('noise_loss', 0)
+                    avg_tv_loss = ema_stats.get('tv_loss', 0)
                     if accelerator.is_main_process:
                         if args.gns:
-                            tqdm.write(f'Epoch: {epoch}, step: {step}, loss: {loss_disp:g}, avg loss: {avg_loss:g}, gns: {gns_stats.get_gns():g}')
+                            tqdm.write(f'Epoch: {epoch}, step: {step}, loss: {loss_disp:g}, avg_loss: {avg_loss:g}, '
+                                     f'diff: {avg_diffusion_loss:g}, noise: {avg_noise_loss:g}, tv: {avg_tv_loss:g}, '
+                                     f'gns: {gns_stats.get_gns():g}')
                         else:
-                            tqdm.write(f'Epoch: {epoch}, step: {step}, loss: {loss_disp:g}, avg loss: {avg_loss:g}')
+                            tqdm.write(f'Epoch: {epoch}, step: {step}, loss: {loss_disp:g}, avg_loss: {avg_loss:g}, '
+                                     f'diff: {avg_diffusion_loss:g}, noise: {avg_noise_loss:g}, tv: {avg_tv_loss:g}')
 
                 with torch.no_grad():
                     if use_tensorboard and step % 50 == 0 and accelerator.is_main_process:
+                        # Log all losses
                         tensorboard_writer.add_scalar('uv_diffuse/avg_loss', ema_stats['loss'], step)
-                        tensorboard_writer.add_scalar('uv_diffuse/avg_mse_loss', ema_stats['mse_loss'], step)
+                        tensorboard_writer.add_scalar('uv_diffuse/avg_diffusion_loss', ema_stats.get('diffusion_loss', 0), step)
+                        tensorboard_writer.add_scalar('uv_diffuse/avg_noise_loss', ema_stats.get('noise_loss', 0), step)
+                        tensorboard_writer.add_scalar('uv_diffuse/avg_tv_loss', ema_stats.get('tv_loss', 0), step)
                         tensorboard_writer.add_scalar('uv_diffuse/loss', loss, step)
+                        tensorboard_writer.add_scalar('uv_diffuse/diffusion_loss', diffusion_loss, step)
+                        tensorboard_writer.add_scalar('uv_diffuse/noise_loss', noise_loss, step)
+                        tensorboard_writer.add_scalar('uv_diffuse/tv_loss', tv_loss, step)
                         tensorboard_writer.add_scalar('uv_diffuse/lr', opt.param_groups[0]['lr'], step)
+                    
                     if use_tensorboard and step % 500 == 0:
-                        # Sample images from the model
-                        nr_imgs_sample = 4
-                        sampled_imgs = sample_images(nr_imgs_sample)
-                        if accelerator.is_main_process:
-                            # UV maps are 3-channel, visualize directly
-                            grid = utils.make_grid(sampled_imgs, nrow=math.ceil(nr_imgs_sample ** 0.5), padding=0)
-                            grid = (grid.clamp(-1, 1) + 1) / 2
-                            tensorboard_writer.add_image('sampled_uv', grid, step)
+                        # Get model prediction for visualization
+                        # Use first batch sample for visualization
+                        if first_batch is not None:
+                            vis_batch = first_batch
+                            vis_uv_og = vis_batch["closed"]["gsplat_params"]["aces_diffuse_alb"][:1]  # [1, 3, H, W]
+                            vis_template = vis_batch["template_teeth"]["gsplat_params"]["aces_diffuse_alb"][:1]
+                            vis_mask = vis_batch["mask"]
+                            if vis_mask.dim() == 3:
+                                vis_mask = vis_mask.unsqueeze(0)
+                            vis_mask_1ch = vis_mask[:1, 0:1, :, :].to(vis_uv_og.device)
+                            vis_uv_comp = vis_uv_og * (1 - vis_mask_1ch) + vis_template * vis_mask_1ch
+                            
+                            # Create input for model
+                            vis_reals = torch.cat([vis_uv_comp, vis_uv_og, vis_mask_1ch], dim=1)
+                            
+                            # Generate noise and get prediction
+                            vis_noise_uv = torch.randn_like(vis_uv_comp) * vis_mask_1ch
+                            vis_noise_zeros = torch.zeros_like(vis_uv_og)
+                            vis_noise_mask = torch.zeros_like(vis_mask_1ch)
+                            vis_noise = torch.cat([vis_noise_uv, vis_noise_zeros, vis_noise_mask], dim=1)
+                            vis_sigma = sample_density([1], device=device)
+                            
+                            # Prepare extra_args for visualization (use latents from first batch if available)
+                            vis_extra_args = {}
+                            if cross_cond and "latents" in vis_batch:
+                                vis_extra_args["latents_dict"] = {
+                                    k: v[:1] if isinstance(v, torch.Tensor) else v 
+                                    for k, v in vis_batch["latents"].items()
+                                }
+                            
+                            # Forward pass to get prediction
+                            vis_noised_input = vis_reals + vis_noise * K.utils.append_dims(vis_sigma, vis_reals.ndim)
+                            vis_c_skip, vis_c_out, vis_c_in = [K.utils.append_dims(x, vis_reals.ndim) for x in model.get_scalings(vis_sigma)]
+                            vis_result = model.inner_model(vis_noised_input * vis_c_in, vis_sigma, **vis_extra_args)
+                            if isinstance(vis_result, tuple):
+                                vis_model_output = vis_result[0]
+                            else:
+                                vis_model_output = vis_result
+                            # Model outputs 7 channels (same as input), but we only need first 3 channels (uv_comp prediction)
+                            vis_model_output_gt = vis_model_output[:, :3, :, :]  # Extract 3 channels from 7-channel output
+                            vis_noised_input_gt = vis_noised_input[:, :3, :, :]
+                            
+                            if model.parametrization == "v":
+                                vis_uv_pred = vis_model_output_gt.to(torch.float32) * vis_c_out + vis_noised_input_gt * vis_c_skip
+                            else:
+                                vis_uv_pred = vis_model_output_gt.to(torch.float32)
+                            
+                            # Sample images conditionally using sample_images function
+                            sampled_imgs_norm = None
+                            nr_imgs_sample = 4
+                            if first_batch is not None:
+                                sample_batch = first_batch
+                                sample_uv_og = sample_batch["closed"]["gsplat_params"]["aces_diffuse_alb"]  # [B, 3, H, W]
+                                sample_mask = sample_batch["mask"]
+                                if sample_mask.dim() == 3:
+                                    sample_mask = sample_mask.unsqueeze(0)
+                                sample_mask_1ch = sample_mask[:, 0:1, :, :].to(sample_uv_og.device)  # [B, 1, H, W]
+                                sample_latents = sample_batch.get("latents", None)
+                                
+                                sampled_imgs = sample_images(
+                                    nr_imgs_sample,
+                                    sample_uv_og,
+                                    sample_latents,
+                                    sample_mask_1ch
+                                )  # [nr_imgs_sample, 3, H, W] - output is already 3 channels
+                                
+                                # Normalize sampled images to [0, 1]
+                                sampled_imgs_norm = (sampled_imgs.clamp(-1, 1) + 1) / 2
+                            
+                            # Normalize images to [0, 1] for visualization (assuming they're in [-1, 1] range)
+                            vis_uv_comp_norm = (vis_uv_comp.clamp(-1, 1) + 1) / 2
+                            vis_uv_og_norm = (vis_uv_og.clamp(-1, 1) + 1) / 2
+                            vis_uv_pred_norm = (vis_uv_pred.clamp(-1, 1) + 1) / 2
+                            
+                            if accelerator.is_main_process:
+                                # Create grid for each image type
+                                grid_comp = utils.make_grid(vis_uv_comp_norm, nrow=1, padding=2)
+                                grid_og = utils.make_grid(vis_uv_og_norm, nrow=1, padding=2)
+                                grid_pred = utils.make_grid(vis_uv_pred_norm, nrow=1, padding=2)
+                                
+                                tensorboard_writer.add_image('images/uv_comp', grid_comp, step)
+                                tensorboard_writer.add_image('images/uv_og', grid_og, step)
+                                tensorboard_writer.add_image('images/uv_pred', grid_pred, step)
+                                
+                                # Create comparison with sampled images
+                                if sampled_imgs_norm is not None:
+                                    # Use first sampled image for comparison
+                                    sampled_first = sampled_imgs_norm[:1]  # [1, 3, H, W]
+                                    # Side-by-side: uv_comp, uv_og, uv_pred, sampled
+                                    comparison = torch.cat([vis_uv_comp_norm, vis_uv_og_norm, vis_uv_pred_norm, sampled_first], dim=0)
+                                    grid_comparison = utils.make_grid(comparison, nrow=4, padding=2)
+                                    tensorboard_writer.add_image('images/comparison', grid_comparison, step)
+                                    
+                                    # Also log all sampled images separately
+                                    grid_sampled = utils.make_grid(sampled_imgs_norm, nrow=math.ceil(nr_imgs_sample ** 0.5), padding=2)
+                                    tensorboard_writer.add_image('images/sampled_uv', grid_sampled, step)
+                                else:
+                                    # Fallback if sampling failed
+                                    comparison = torch.cat([vis_uv_comp_norm, vis_uv_og_norm, vis_uv_pred_norm], dim=0)
+                                    grid_comparison = utils.make_grid(comparison, nrow=3, padding=2)
+                                    tensorboard_writer.add_image('images/comparison', grid_comparison, step)
 
                 step += 1
 

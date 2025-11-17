@@ -265,7 +265,7 @@ def make_model(config):
             levels=levels,
             mapping=mapping,
             in_channels=config['input_channels'],
-            out_channels=config.get('out_channels', config['input_channels']),  # Default to input_channels if not specified
+            out_channels=config['input_channels'],
             patch_size=config['patch_size'],
             num_classes=num_classes + 1 if num_classes else 0,
             mapping_cond_dim=config['mapping_cond_dim'],
@@ -298,7 +298,7 @@ def make_model(config):
             levels=levels,
             mapping=mapping,
             in_channels=config['input_channels'],
-            out_channels=config.get('out_channels', config['input_channels']),  # Default to input_channels if not specified
+            out_channels=config['input_channels'],
             patch_size=config['patch_size'],
             input_size=config['input_size'],
             num_classes=num_classes + 1 if num_classes else 0,
@@ -335,7 +335,7 @@ def make_model(config):
             levels=levels,
             mapping=mapping,
             in_channels=config['input_channels'],
-            out_channels=config.get('out_channels', config['input_channels']),  # Default to input_channels if not specified
+            out_channels=config['input_channels'],
             patch_size=config['patch_size'],
             input_size=config['input_size'],
             num_classes=num_classes + 1 if num_classes else 0,
@@ -369,7 +369,7 @@ def make_model(config):
             levels=levels,
             mapping=mapping,
             in_channels=config['input_channels'],
-            out_channels=config.get('out_channels', config['input_channels']),  # Default to input_channels if not specified
+            out_channels=config['input_channels'],
             patch_size=config['patch_size'],
             num_classes=num_classes + 1 if num_classes else 0,
             mapping_cond_dim=config['mapping_cond_dim'],

@@ -1,0 +1,72 @@
+{
+
+    "model": {
+        "type": "image_transformer_v2_conditional",
+        "mapping_depth": 2,
+        "cross_cond": 1,
+        "condition_dropout_rate": 0.1,
+        "input_channels": 7,
+        "out_channels": 3,
+        "input_size": [512, 512],
+        "patch_size": [4, 4],
+        "depths": [2, 2, 2],
+        "widths": [1024, 2048, 3072],
+        "d_ffs": [1024, 2048, 3072],
+        "self_attns": [
+            {"type": "neighborhood", "d_head": 64, "kernel_size": 7},
+            {"type": "neighborhood", "d_head": 64, "kernel_size": 7},
+            {"type": "global", "d_head": 64}
+        ],
+        "parametrization": "v",
+        "loss_config": "karras",
+        "loss_weighting": "snr",
+        "dropout_rate": [0.0, 0.0, 0.1],
+        "mapping_width": 768,
+        "mapping_d_ff": 1024,
+        "mapping_dropout_rate": 0.0,
+        "augment_prob": 0.0,
+        "sigma_data": 0.3,
+        "sigma_min": 1e-2,
+        "sigma_max": 160,
+        "sigma_sample_density": {
+            "type": "cosine-interpolated",
+            "noise_d_low": 64
+        },
+
+        "rgb_condition":{
+            "global_condition_shape": [1, 1024],
+            "local_condition_shapes": [
+                {"shape": [1, 1024, 55, 55]},
+                {"shape": [1, 1024, 55, 55]},
+                {"shape": [1, 1024, 55, 55]}
+            ],
+            "cross_condition_dim": [512,512,512],
+            "self_attn": [false,true,true]
+        },
+
+        "loss_weight_per_channel":[
+            1.0,1.0,1.0
+        ]
+    },
+    "dataset": {
+        "type": "imagefolder",
+        "num_classes": 0,
+        "cond_dropout_rate": 0.1
+    },
+    "optimizer": {
+        "lr": 5e-4,
+        "betas": [0.9, 0.95],
+        "eps": 1e-8,
+        "weight_decay": 1e-3
+    },
+    "lr_sched": {
+        "type": "constant",
+        "warmup": 0.0
+    },
+    "ema_sched": {
+        "type": "inverse",
+        "power": 0.75,
+        "max_value": 0.9999
+    }
+}
+
