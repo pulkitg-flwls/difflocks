@@ -29,14 +29,14 @@ import sys
 import os
 import random
 
-# Import k_diffusion
-import k_diffusion as K
-
-# Add parent directory to path
+# Add parent directory to path (before importing k_diffusion)
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
+# Import k_diffusion (local module in difflocks/)
+import k_diffusion as K
+
 # Import our modules
-from uv_diffusion_model import create_uv_diffusion_model, initialize_dinov2, extract_dinov2_features
+from uv_diffusion_model import create_uv_diffusion_model
 from dataloader_gsplat import SilentDubDataset
 
 torch._dynamo.config.optimize_ddp = False
@@ -98,66 +98,6 @@ def get_cli_args():
 
     return args
 
-class UVDatasetWithDINOv2(data.Dataset):
-    """
-    Wrapper dataset that extracts DINOv2 features from FOTD images.
-    
-    Training setup:
-    - Target (reals): open["gsplat_params"]["aces_diffuse_alb"] - open mouth UV map
-    - Conditioning: closed["fotd_params"]["ref_img"] - closed RGB image (via DINOv2)
-    - Closed UV is available for initialization during inference, not used in training loss
-    """
-    def __init__(self, base_dataset, dinov2_model, device='cpu'):
-        self.base_dataset = base_dataset
-        self.dinov2_model = dinov2_model
-        self.device = device
-        self.dinov2_model.eval()
-    
-    def __len__(self):
-        return len(self.base_dataset)
-    
-    def __getitem__(self, idx):
-        sample = self.base_dataset[idx]
-        
-        # UV maps: 
-        # - closed: available for initialization during inference [3, 512, 512]
-        # - open: target UV map for diffusion training [3, 512, 512]
-        uv_closed = sample["closed"]["gsplat_params"]["aces_diffuse_alb"]  # [3, 512, 512]
-        uv_open = sample["open"]["gsplat_params"]["aces_diffuse_alb"]  # [3, 512, 512]
-        
-        # DINOv2 conditioning: closed RGB reference image
-        # Note: fotd_ref is already preprocessed (resized to 770x770 and ImageNet normalized)
-        # Input to HDiT: DINOv2 features from closed["fotd_params"]["ref_img"]
-        fotd_ref = sample["closed"]["fotd_params"]["ref_img"]  # [3, 770, 770]
-        
-        # Extract DINOv2 features directly from preprocessed image
-        with torch.no_grad():
-            rgb_input = fotd_ref.unsqueeze(0).to(self.device)  # [1, 3, 770, 770]
-            dinov2_output = self.dinov2_model.forward_features(rgb_input)
-            
-            # Extract features (same as extract_dinov2_features but without re-preprocessing)
-            patch_tok = dinov2_output["x_norm_patchtokens"].clone()
-            cls_tok = dinov2_output["x_norm_clstoken"].clone()
-            
-            # Reshape patch tokens to spatial format
-            batch_size, num_patches, hidden_size = patch_tok.shape
-            h = w = int(num_patches ** 0.5)  # Should be 55x55 for 770x770 input
-            patch_embeddings = patch_tok.reshape(batch_size, h, w, hidden_size)
-            patch_embeddings = patch_embeddings.permute(0, 3, 1, 2).contiguous()
-            
-            dinov2_features = {
-                "cls_token": cls_tok.squeeze(0),  # [1024]
-                "final_latent": patch_embeddings.squeeze(0)  # [1024, 55, 55]
-            }
-        
-        return {
-            "uv_closed": uv_closed,  # Closed UV: used for initialization during inference
-            "uv_open": uv_open,      # Open UV: target for diffusion training (reals)
-            "latents": {
-                "dinov2": dinov2_features  # DINOv2 features from closed RGB image
-            }
-        }
-
 def main():
     args = get_cli_args()
 
@@ -197,12 +137,6 @@ def main():
         np.random.seed(seeds[accelerator.process_index])
         random.seed(seeds[accelerator.process_index])
     demo_gen = torch.Generator().manual_seed(torch.randint(-2 ** 63, 2 ** 63 - 1, ()).item())
-
-    # Initialize DINOv2 model (needed for dataset)
-    print("Initializing DINOv2...")
-    dinov2_model, dinov2_preprocessor = initialize_dinov2()
-    dinov2_model = dinov2_model.to(device)
-    dinov2_model.eval()
 
     # Create UV diffusion model
     inner_model = create_uv_diffusion_model()
@@ -248,17 +182,15 @@ def main():
                                   max_value=ema_sched_config['max_value'])
     ema_stats = {}
 
-    # Create base dataset
-    base_dataset = SilentDubDataset(
+    # Create dataset (DINOv2 extraction is now done inside SilentDubDataset)
+    train_set = SilentDubDataset(
         root_dir=args.root_dir,
         json_dir=args.json_dir,
         mask_path=args.mask_path,
         device=device,
-        open_ratio_threshold=args.open_ratio_threshold
+        open_ratio_threshold=args.open_ratio_threshold,
+        load_dinov2=True  # Enable DINOv2 feature extraction in dataset
     )
-    
-    # Wrap with DINOv2 feature extraction
-    train_set = UVDatasetWithDINOv2(base_dataset, dinov2_model, device=device)
 
     if accelerator.is_main_process:
         try:
@@ -269,8 +201,13 @@ def main():
     num_classes = dataset_config.get('num_classes', 0)
     cond_dropout_rate = dataset_config.get('cond_dropout_rate', 0.1)
 
+    # DINOv2 extraction is now handled inside SilentDubDataset.__getitem__
+    # If using num_workers > 0, each worker will load its own DINOv2 model
+    # This may use more memory but should work correctly
     train_dl = data.DataLoader(train_set, args.batch_size, shuffle=True, drop_last=True,
-                               num_workers=args.num_workers, persistent_workers=True, pin_memory=True)
+                               num_workers=args.num_workers, 
+                               persistent_workers=args.num_workers > 0, 
+                               pin_memory=True)
 
     inner_model, inner_model_ema, opt, train_dl = accelerator.prepare(inner_model, inner_model_ema, opt, train_dl)
 
@@ -415,9 +352,9 @@ def main():
                         # - reals: open mouth UV map (target) [B, 3, 512, 512]
                         # - Input to HDiT during training: noise + open_UV (via diffusion)
                         # - Conditioning: DINOv2 features from closed RGB image
-                        # - Closed UV (batch["uv_closed"]) available but not used in training loss
+                        # - Closed UV (batch["closed"]["gsplat_params"]["aces_diffuse_alb"]) available but not used in training loss
                         #   (can be used for initialization during inference)
-                        reals = batch["uv_open"]  # Target: open mouth UV map [B, 3, 512, 512]
+                        reals = batch["open"]["gsplat_params"]["aces_diffuse_alb"]  # Target: open mouth UV map [B, 3, 512, 512]
 
                     class_cond, extra_args = None, {}
                     cross_cond = bool(model_config['cross_cond'])

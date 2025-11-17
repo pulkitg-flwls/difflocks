@@ -6,6 +6,7 @@ import torch
 import numpy as np
 import cv2
 from pathlib import Path
+import matplotlib.cm as cm
 
 def tensor_to_cv(img_tensor, minmax_normalize=False):
     """
@@ -108,17 +109,17 @@ def load_fotd(fotd_path, frame_idx, device):
     """
     fotd_params_path = fotd_path / f"{frame_idx}.png"
     fotd_params_arr = np.array(Image.open(fotd_params_path))
-    fotd_params_arr = (fotd_params_arr / 255.0) # Normalize from [0,255] to [0,1]
+    fotd_params_arr = (fotd_params_arr / 255.0).astype(np.float32) # Normalize from [0,255] to [0,1]
     # Dinov2 preprocessing requires image to be in [0,1] and normalized with ImageNet normalization
     preprocessor = T.Compose([
         T.Resize((770, 770), interpolation=T.InterpolationMode.BICUBIC),
         T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
     ])
-    ref_img = torch.from_numpy(fotd_params_arr[:, :1024, :]).contiguous().permute(2,1,0)
+    ref_img = torch.from_numpy(fotd_params_arr[:, :1024, :]).to(torch.float32).contiguous().permute(2,1,0)
     ref_img = preprocessor(ref_img)
-    fotd_img = torch.from_numpy(fotd_params_arr[:, 1024:2048, :]).contiguous().permute(2,1,0)
-    st_img = torch.from_numpy(fotd_params_arr[:, 2048:3072, :]).contiguous().permute(2,1,0)
-    mask_img = torch.from_numpy(fotd_params_arr[:, 3072:4096, :]).contiguous().permute(2,1,0)
+    fotd_img = torch.from_numpy(fotd_params_arr[:, 1024:2048, :]).to(torch.float32).contiguous().permute(2,1,0)
+    st_img = torch.from_numpy(fotd_params_arr[:, 2048:3072, :]).to(torch.float32).contiguous().permute(2,1,0)
+    mask_img = torch.from_numpy(fotd_params_arr[:, 3072:4096, :]).to(torch.float32).contiguous().permute(2,1,0)
     return {
         "ref_img": ref_img,
         "fotd_img": fotd_img,
@@ -140,14 +141,18 @@ class SilentDubDataset(Dataset):
     __getitem__ : returns a random pair of open/closed frames from the same track.
     During training, the input is reference image and gsplat parameters of closed frame and output is gsplat parameters of open frame.
     Each __getitem__ returns a pair of open/closed frames from the same track.
+    
+    Also extracts DINOv2 features from closed RGB image for conditioning.
     """
 
-    def __init__(self, root_dir, json_dir,mask_path, device='cpu', open_ratio_threshold=0.1):
+    def __init__(self, root_dir, json_dir, mask_path, device='cpu', open_ratio_threshold=0.1, load_dinov2=True, template_dir=None):
         self.root_dir = Path(root_dir)
         self.json_dir = Path(json_dir)
         self.device = device
         self.open_ratio_threshold = open_ratio_threshold
-        self.mask = np.array(Image.open(mask_path).convert("RGB"))/255.0    #[512,512,3]    # mask
+        self.load_dinov2 = load_dinov2
+        
+        self.mask = (np.array(Image.open(mask_path).convert("RGB"))/255.0).astype(np.float32)    #[512,512,3]    # mask
         self.mask = torch.from_numpy(self.mask).to(torch.float32).contiguous().permute(2,1,0).to(device)
         print(f"Mask shapes: {self.mask.shape}")
         
@@ -155,10 +160,38 @@ class SilentDubDataset(Dataset):
         self.gsplat_dir = self.root_dir / "train_gsplatParams_BOHR_trackformer-5.2.gteeth-dev-1"
         self.fotd_dir = self.root_dir / "train_plate_fotd_BOHR_trackformer-5.2.gteeth-dev-1_sym"
         
+        # Load template teeth if provided
+        self.template_teeth = None
+        if template_dir is not None:
+            template_dir = Path(template_dir)
+            template_gsplat_path = template_dir / "gsplat.npy"
+            template_fotd_path = template_dir / "fotd.png"
+            if template_gsplat_path.exists() and template_fotd_path.exists():
+                # Load template gsplat - expects directory and frame_idx (stem)
+                template_gsplat_params = load_gsplat(template_dir, "gsplat", self.device)
+                # Load template fotd - expects directory and frame_idx (stem)
+                template_fotd_params = load_fotd(template_dir, "fotd", self.device)
+                self.template_teeth = {
+                    "gsplat_params": template_gsplat_params,
+                    "fotd_params": template_fotd_params
+                }
+                print(f"Loaded template teeth from {template_dir}")
+            else:
+                print(f"Warning: Template files not found in {template_dir}: expected gsplat.npy and fotd.png")
+        
         # Build track data structure: trackname -> {open_frames, closed_frames}
         self.track_data = {}
         self.tracks = []
         self._scan_directories()
+        
+        # Initialize DINOv2 model for feature extraction
+        self.dinov2_model = None
+        if self.load_dinov2:
+            print("Initializing DINOv2 model...")
+            self.dinov2_model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14_reg')
+            self.dinov2_model.eval()
+            self.dinov2_model = self.dinov2_model.to(device)
+            print("DINOv2 model loaded and moved to device")
         
         print(f"Loaded {len(self.tracks)} tracks with open/closed frame pairs")
     
@@ -239,6 +272,40 @@ class SilentDubDataset(Dataset):
         """Return total number of tracks (each call returns one open/closed pair)."""
         return len(self.tracks)
 
+    def _extract_dinov2_features(self, rgb_image):
+        """
+        Extract DINOv2 features from RGB image.
+        
+        Args:
+            rgb_image: Preprocessed RGB image tensor [3, 770, 770] (already normalized)
+        
+        Returns:
+            dict with 'cls_token' [1024] and 'final_latent' [1024, 55, 55]
+        """
+        if self.dinov2_model is None:
+            return None
+        
+        with torch.no_grad():
+            rgb_input = rgb_image.unsqueeze(0).to(torch.float32).to(self.device)  # [1, 3, 770, 770]
+            dinov2_output = self.dinov2_model.forward_features(rgb_input)
+            
+            # Extract features
+            patch_tok = dinov2_output["x_norm_patchtokens"].clone()
+            cls_tok = dinov2_output["x_norm_clstoken"].clone()
+            
+            # Reshape patch tokens to spatial format
+            batch_size, num_patches, hidden_size = patch_tok.shape
+            h = w = int(num_patches ** 0.5)  # Should be 55x55 for 770x770 input
+            patch_embeddings = patch_tok.reshape(batch_size, h, w, hidden_size)
+            patch_embeddings = patch_embeddings.permute(0, 3, 1, 2).contiguous()
+            
+            dinov2_features = {
+                "cls_token": cls_tok.squeeze(0),  # [1024]
+                "final_latent": patch_embeddings.squeeze(0)  # [1024, 55, 55]
+            }
+        
+        return dinov2_features
+    
     def __getitem__(self, idx):
         """Return one open/closed frame pair from a randomly sampled track."""
         # Randomly sample a track
@@ -264,7 +331,17 @@ class SilentDubDataset(Dataset):
         open_fotd_params = load_fotd(fotd_track_dir, open_frame_idx, self.device)
         closed_fotd_params = load_fotd(fotd_track_dir, closed_frame_idx, self.device)
         
-        return {
+        # Extract DINOv2 features from closed RGB image for conditioning
+        latents = None
+        if self.load_dinov2:
+            # closed_fotd_params["ref_img"] is already preprocessed [3, 770, 770]
+            dinov2_features = self._extract_dinov2_features(closed_fotd_params["ref_img"])
+            if dinov2_features is not None:
+                latents = {
+                    "dinov2": dinov2_features
+                }
+        
+        result = {
             "open": {
                 "gsplat_params": open_gsplat_params,
                 "fotd_params": open_fotd_params
@@ -275,6 +352,14 @@ class SilentDubDataset(Dataset):
             },
             "mask": self.mask
         }
+        
+        if self.template_teeth is not None:
+            result["template_teeth"] = self.template_teeth
+        
+        if latents is not None:
+            result["latents"] = latents
+        
+        return result
 
 # ------------------------------------------------------------------------- #
 if __name__ == "__main__":
@@ -282,13 +367,14 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", help="Folder with %05d.png images")
     parser.add_argument("--json_dir", help="Original per-frame scores JSON")
     parser.add_argument("--mask_path", help="UV Mask")
-    parser.add_argument("--template_path", help="UV Mask")
+    parser.add_argument("--template_dir", help="Template directory")
     parser.add_argument("--thresh",    type=float, default=0.5, help="Open/closed cut-off")
     parser.add_argument("--batch_size", type=int,  default=4)
     parser.add_argument("--fp16",     action="store_true", help="Half-precision tensors")
     parser.add_argument("--save_json", help="Write split JSON here (optional)")
     parser.add_argument("--root_dir", required=True, help="Root directory")
     parser.add_argument("--track_clip", help="Track clip name")
+    parser.add_argument("--load_dinov2", action="store_true", help="Load DINOv2 features")
     args = parser.parse_args()
 
     ROOT = Path(args.root_dir)
@@ -304,7 +390,9 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Simple usage - requires json_dir argument now
-    dataset = SilentDubDataset(ROOT, json_dir=args.json_dir, mask_path=args.mask_path, device=device)
+    dataset = SilentDubDataset(ROOT, json_dir=args.json_dir, mask_path=args.mask_path, \
+                                template_dir=args.template_dir,load_dinov2=args.load_dinov2, \
+                                open_ratio_threshold=args.thresh, device=device)
     print(f"Dataset size: {len(dataset)}")
     
     # Test loading a sample
@@ -338,18 +426,101 @@ if __name__ == "__main__":
         gsplat_open_pad = pad_to_770(gsplat_open)
         gsplat_close_pad = pad_to_770(gsplat_close)
 
+        # Add labels to images
+        def add_label(img, text, position='top-left'):
+            """Add text label to image. img is BGR uint8."""
+            img_labeled = img.copy()
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 1.5
+            thickness = 3
+            color = (255, 255, 255)  # White text
+            bg_color = (0, 0, 0)  # Black background
+            
+            # Get text size
+            (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+            
+            if position == 'top-left':
+                x, y = 10, 40
+            elif position == 'top-right':
+                x, y = img.shape[1] - text_width - 10, 40
+            else:
+                x, y = 10, 40
+            
+            # Draw background rectangle
+            cv2.rectangle(img_labeled, (x - 5, y - text_height - 5), 
+                         (x + text_width + 5, y + baseline + 5), bg_color, -1)
+            # Draw text
+            cv2.putText(img_labeled, text, (x, y), font, font_scale, color, thickness)
+            return img_labeled
+        
+        # Add labels to individual images before concatenation
+        fotd_open_labeled = add_label(fotd_open, "Open Mouth")
+        gsplat_open_labeled = add_label(gsplat_open_pad, "Open Mouth", position='top-right')
+        fotd_close_labeled = add_label(fotd_close, "Closed Mouth")
+        gsplat_close_labeled = add_label(gsplat_close_pad, "Closed Mouth", position='top-right')
+        
         # Concatenate top row: [fotd_open, gsplat_open_pad]
-        row1 = np.concatenate([fotd_open, gsplat_open_pad], axis=1)
+        row1 = np.concatenate([fotd_open_labeled, gsplat_open_labeled], axis=1)
         # Concatenate bottom row: [fotd_close, gsplat_close_pad]
-        row2 = np.concatenate([fotd_close, gsplat_close_pad], axis=1)
+        row2 = np.concatenate([fotd_close_labeled, gsplat_close_labeled], axis=1)
         # Stack rows vertically
         vis_img = np.concatenate([row1, row2], axis=0)
+
+        
+        
+        if sample.get("template_teeth") is not None:
+            template_gsplat = tensor_to_cv(sample["template_teeth"]["gsplat_params"]["aces_diffuse_alb"], minmax_normalize=True)
+            template_fotd = tensor_to_cv(sample["template_teeth"]["fotd_params"]["ref_img"], minmax_normalize=False)
+            template_gsplat_pad = pad_to_770(template_gsplat)
+            template_fotd_pad = pad_to_770(template_fotd)
+            
+            # Add labels to template images
+            template_fotd_labeled = add_label(template_fotd_pad, "Template Teeth")
+            template_gsplat_labeled = add_label(template_gsplat_pad, "Template Teeth", position='top-right')
+            
+            row3 = np.concatenate([template_fotd_labeled, template_gsplat_labeled], axis=1)
+            vis_img = np.concatenate([vis_img, row3], axis=0)
 
         print(f"viz img shape (HxW): {vis_img.shape}")
         out_path = f"test_images/composite_fotd_gsplat_grid.png"
         Image.fromarray(vis_img).save(out_path)
         
-        
+        # Visualize DINOv2 global latent (cls_token) if available
+        # if sample.get("latents") is not None and "dinov2" in sample["latents"]:
+        #     print("Visualizing DINOv2 global latent...")
+        #     cls_token = sample["latents"]["dinov2"]["cls_token"]  # [1024]
+            
+        #     # Convert to numpy and reshape to 2D grid (32x32 = 1024)
+        #     cls_token_np = cls_token.detach().cpu().numpy()
+        #     cls_token_2d = cls_token_np.reshape(32, 32)
+            
+        #     # Normalize to [0, 1] for visualization
+        #     cls_token_min = cls_token_2d.min()
+        #     cls_token_max = cls_token_2d.max()
+        #     if cls_token_max > cls_token_min:
+        #         cls_token_norm = (cls_token_2d - cls_token_min) / (cls_token_max - cls_token_min)
+        #     else:
+        #         cls_token_norm = cls_token_2d
+            
+        #     # Apply colormap (viridis) and convert to uint8
+        #     colormap = cm.get_cmap('viridis')
+        #     cls_token_colored = colormap(cls_token_norm)[:, :, :3]  # Remove alpha channel
+        #     cls_token_uint8 = (cls_token_colored * 255).astype(np.uint8)
+            
+        #     # Resize to a larger size for better visibility (e.g., 512x512)
+        #     cls_token_resized = cv2.resize(cls_token_uint8, (512, 512), interpolation=cv2.INTER_NEAREST)
+            
+        #     # Convert RGB to BGR for consistency with other images
+        #     cls_token_bgr = cv2.cvtColor(cls_token_resized, cv2.COLOR_RGB2BGR)
+            
+        #     # Add label
+        #     cls_token_labeled = add_label(cls_token_bgr, "DINOv2 Global Latent")
+            
+        #     # Save visualization
+        #     dinov2_out_path = f"test_images/dinov2_global_latent.png"
+        #     Image.fromarray(cls_token_labeled).save(dinov2_out_path)
+        #     print(f"Saved DINOv2 global latent visualization to {dinov2_out_path}")
+
         # img_path = f"test_images/gsplat_open_uvmap.png"
         # img = open_data['gsplat_params']['aces_diffuse_alb']
         # np_img = tensor_to_cv(img,minmax_normalize=True)

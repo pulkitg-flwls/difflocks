@@ -1,8 +1,9 @@
 # Silent Vub
 
 ## Dataloader
+Template_dir has the fotd and gsplat images. Json dir has json containing Mouth open ratio which the thresh argument decides.
 ```
-python dataloader_gsplat.py --root_dir /app/data/vfhq/ --json_dir json_dir/ --mask_path test_images/mask.png
+python dataloader_gsplat.py --root_dir /app/data/vfhq/ --json_dir json_dir/ --mask_path template/mask.png --template_dir template/ --thresh 0.5
 ```
 
 ```
